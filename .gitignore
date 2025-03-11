@@ -132,3 +132,5 @@ cache
 # some files which should never be included
 *.lic
 *.LIC
+# Environment files
+*.env

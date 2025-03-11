@@ -29,6 +29,46 @@ definitions:
           - ./automations/20_commit_code.sh config.yml
           - git status
           - git push
+    - step: &check-for-status
+        name: Wait for container to terminate
+        image: mcr.microsoft.com/azure-cli
+        script:
+          - az login --service-principal --username $TRACE_spnClientId --password $TRACE_spnSecret --tenant $TRACE_tenantId
+          - |
+            sleep_counter=10
+            start_time=$(date +%s)  
+            sleep_max=1200 
+            STATUS="Initiate"
+
+            until [ "$STATUS" = "Succeeded" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Canceled" ]; do
+              current_time=$(date +%s)   
+              
+              if [ "$cumulative_time" -gt "$sleep_max" ]; then
+                echo "Timeout reached after $cumulative_time seconds. Exiting."
+                exit 0
+              fi     
+
+              
+              echo "Sleeping for $sleep_counter seconds."
+              sleep $sleep_counter
+              
+              sleep_counter=$((sleep_counter * 2)) 
+
+              STATUS=$(az container show --resource-group $TRACE_resourceGroup --name $TRACE_azContainerName --query "instanceView.state" -o tsv)
+              cumulative_time=$((current_time - start_time)) 
+              echo "Container status: $STATUS"
+              echo "Cumulative time: $cumulative_time seconds"
+            done
+
+    - step: &retrieve-logs-artifacts
+        name: Retrieve container logs
+        image: mcr.microsoft.com/azure-cli
+        script:
+          - az login --service-principal --username $TRACE_spnClientId --password $TRACE_spnSecret --tenant $TRACE_tenantId
+          - mkdir -p ./logs
+          - az container logs --resource-group $TRACE_resourceGroup --name $TRACE_azContainerName > ./logs/azure_logs.txt
+        artifacts:
+          - logs/azure_logs.txt
 
 pipelines:
   custom:
@@ -273,7 +313,7 @@ pipelines:
             - git add $openICPSRID
             - git commit -m "[skip ci] Converted EPS and PDF to PNG"
             - git push
-    w-big-populate-from-icpsr: #name of this pipeline
+    w-big-populate-from-azure: #name of this pipeline
       - variables:          #list variable names under here
           # These do not need to have a value, if "config.yml" is filled out.
           - name: openICPSRID   
@@ -289,19 +329,52 @@ pipelines:
             - . ./tools/parse_yaml.sh
             - eval $(parse_yaml config.yml)
             - if [ -d $openICPSRID ]; then \rm -rf $openICPSRID; fi
-            - if [ -f tools/download_openicpsr-private.py ]; then python3 tools/download_openicpsr-private.py $openICPSRID; fi
-            - mkdir cache
-            - mv *.zip cache/
+            # - if [ -f tools/download_openicpsr-private.py ]; then python3 tools/download_openicpsr-private.py $openICPSRID; fi
+            # Define Azure storage mount path dynamically
+            - export TRACE_azureMountPath="/mnt/workspace/$TRACE_fileShare"
+            - az login --service-principal --username $TRACE_spnClientId --password $TRACE_spnSecret --tenant $TRACE_tenantId
+            # Check if the file share named "workspace" exists
+            - |
+              if az storage share-rm list \
+                --resource-group "$TRACE_resourceGroup" \
+                --storage-account "$TRACE_storageAccountName" \
+                --query "[?name=='workspace']" \
+                --output tsv | grep -q "workspace"; then 
+                echo "File share 'workspace' exists." 
+              else
+                echo "File share 'workspace' does not exist. Creating..."
+                az storage share-rm create \
+                  --resource-group "$TRACE_resourceGroup" \
+                  --storage-account "$TRACE_storageAccountName" \
+                  --name "workspace" \
+                  --access-tier Hot
+                echo "File share 'workspace' created successfully."
+              fi
+
+
+            # Mount Azure File Share to Bitbucket runner at /mnt/workspace
+            - sudo apt-get update && sudo apt-get install -y cifs-utils
+            - sudo mkdir -p /mnt/workspace
+            - sudo mount -t cifs //$TRACE_storageAccountName.file.core.windows.net/workspace /mnt/workspace -o vers=3.0,username=$TRACE_storageAccountName,password=$TRACE_storageAccessKey,dir_mode=0777,file_mode=0777
+            - ls -l /mnt/workspace  # Verify that the workspace file share is accessible
+
+            - mkdir -p /mnt/workspace/$TRACE_fileShare
+            - ls -l /mnt/workspace  # Verify that subfolder exists
+
+            # Save downloaded files directly to file share
+            - if [ -f tools/download_openicpsr-private.py ]; then python3 tools/download_openicpsr-private.py $openICPSRID --output /mnt/workspace/$TRACE_fileShare/ fi
+
+
             - chmod a+rx ./automations/*.sh
             - ./automations/00_prepare_aux.sh
-            - ./automations/01_check_file_sizes.sh $openICPSRID
-            - ./automations/02_list_data_files.sh $openICPSRID
-            - ./automations/03_list_program_files.sh $openICPSRID
-            - ./automations/04_create_manifest.sh $openICPSRID
-            - ./automations/06_check_duplicates_and_zero_bytes.sh $openICPSRID
+            - ./automations/01_check_file_sizes.sh $TRACE_azureMountPath
+            - ./automations/02_list_data_files.sh $TRACE_azureMountPath
+            - ./automations/03_list_program_files.sh $TRACE_azureMountPath
+            - ./automations/04_create_manifest.sh $TRACE_azureMountPath
+            - ./automations/06_check_duplicates_and_zero_bytes.sh $TRACE_azureMountPath
             - ./automations/24_amend_report.sh
-            - ./automations/20_commit_code.sh $openICPSRID
-            - ./automations/21_cleanup.sh     $openICPSRID
+            - ./automations/20_commit_code.sh $TRACE_azureMountPath
+            - ./automations/21_cleanup.sh     $TRACE_azureMountPath
             - ./automations/25_replace_report.sh
             - ./automations/30_cleanup_aux.sh
             - ./tools/update_config.sh
@@ -309,6 +382,57 @@ pipelines:
             - git status
             - git push 
             - git push --tags 
+      - step:
+          name:  Login to ACR and Pull, Tag, and Push Existing Docker Image
+          services:
+            - docker
+          script:
+            # Log in to ACR
+            - docker login $TRACE_containerRegistry.azurecr.io --username $TRACE_spnClientId --password $TRACE_spnSecret
+
+            # Build the docker image using Linux platform, name the image
+            - docker build --platform linux/amd64 -t $TRACE_containerImageName .
+
+            # Tag the image with the remote repo name/path
+            - docker tag $TRACE_containerImageName $TRACE_containerImagePath
+
+            # Push the tagged image to the repo
+            - docker push $TRACE_containerImagePath
+      - step:
+          name: Copy Files into File Share
+          image: victorialiu/azure-cli-with-azcopy
+          script:      
+            - az login --service-principal --username $TRACE_spnClientId --password $TRACE_spnSecret --tenant $TRACE_tenantId
+            # Copy files into file share 
+            - azcopy copy "$TRACE_fileShare/*" "https://$TRACE_storageAccountName.file.core.windows.net/workspace/$TRACE_fileShare?$TRACE_sasToken" --recursive
+      
+      - step:
+          name: Deploy Azure Container Instance
+          image: victorialiu/azure-cli-with-azcopy
+          script:
+            - az login --service-principal --username $TRACE_spnClientId --password $TRACE_spnSecret --tenant $TRACE_tenantId
+            - az container create 
+                --resource-group "$TRACE_resourceGroup" 
+                --name "$TRACE_azContainerName" 
+                --image "$TRACE_containerImagePath" 
+                --environment-variables SLEEP_PERIOD=5 SLEEP_LOOP=15 STORAGE_FILESHARE_PATH=/home/rstudio/workspace/$TRACE_fileShare 
+                --restart-policy Never 
+                --cpu 2 
+                --memory 2 
+                --registry-login-server "$TRACE_containerRegistry.azurecr.io" 
+                --registry-username "$TRACE_spnClientId" 
+                --registry-password "$TRACE_spnSecret" 
+                --vnet "$TRACE_vnet" 
+                --subnet "$TRACE_subnet" 
+                --azure-file-volume-share-name workspace 
+                --azure-file-volume-account-name "$TRACE_storageAccountName" 
+                --azure-file-volume-account-key "$TRACE_storageAccessKey" 
+                --azure-file-volume-mount-path /home/rstudio/workspace 
+                --subscription "$TRACE_subscriptionId"
+      - step: *check-for-status
+      - step: *retrieve-logs-artifacts
+              
+      
 
     x-run-python: 
       - variables: 
