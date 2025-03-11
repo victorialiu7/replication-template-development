@@ -382,6 +382,14 @@ pipelines:
             - git status
             - git push 
             - git push --tags 
+
+    build-and-run-azure-container:
+      - variables:          #list variable names under here
+          - name: RunStuff
+            default: "yes"
+            allowed-values:
+              - "no"
+              - "yes"
       - step:
           name:  Login to ACR and Pull, Tag, and Push Existing Docker Image
           services:
