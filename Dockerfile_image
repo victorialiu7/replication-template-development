@@ -1,0 +1,7 @@
+FROM mcr.microsoft.com/azure-cli
+
+# Install AzCopy
+RUN wget -O azcopy.tar https://aka.ms/downloadazcopy-v10-linux && \
+    tar -xvf azcopy.tar -C /tmp && \
+    mv /tmp/azcopy_linux_amd64_*/azcopy /usr/bin/ && \
+    rm azcopy.tar
